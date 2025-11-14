@@ -47,6 +47,12 @@ defmodule OpentelemetryPlug do
     # register the tracer - this function was deprecated in newer versions
     # _ = OpenTelemetry.register_application_tracer(:opentelemetry_plug)
 
+    # Detach existing handlers to prevent crashes on multiple setup() calls
+    # (e.g., during hot code reloading or application restarts)
+    _ = :telemetry.detach({__MODULE__, :plug_router_start})
+    _ = :telemetry.detach({__MODULE__, :plug_router_stop})
+    _ = :telemetry.detach({__MODULE__, :plug_router_exception})
+
     :telemetry.attach(
       {__MODULE__, :plug_router_start},
       [:plug, :router_dispatch, :start],
@@ -71,40 +77,58 @@ defmodule OpentelemetryPlug do
 
   @doc false
   def handle_start(_, _measurements, %{conn: conn, route: route}, _config) do
-    save_parent_ctx()
-    # setup OpenTelemetry context based on request headers
-    :otel_propagator_text_map.extract(conn.req_headers)
+    # Wrap the entire handler in try/rescue to prevent context leaks on errors
+    try do
+      save_parent_ctx()
 
-    span_name = "#{route}"
+      # Setup OpenTelemetry context based on request headers
+      # Gracefully handle malformed headers or extraction errors
+      try do
+        :otel_propagator_text_map.extract(conn.req_headers)
+      rescue
+        _ -> :ok
+      end
 
-    peer_data = Plug.Conn.get_peer_data(conn)
+      span_name = "#{route}"
 
-    user_agent = header_or_empty(conn, "User-Agent")
-    host = header_or_empty(conn, "Host")
-    peer_ip = Map.get(peer_data, :address)
+      # Safely extract peer data with defaults for missing values
+      peer_data = Plug.Conn.get_peer_data(conn) || %{}
 
-    attributes =
-      [
-        "http.target": conn.request_path,
-        "http.host": conn.host,
-        "http.scheme": conn.scheme,
-        "http.flavor": http_flavor(conn.adapter),
-        "http.route": route,
-        "http.user_agent": user_agent,
-        "http.method": conn.method,
-        "net.peer.ip": to_string(:inet_parse.ntoa(peer_ip)),
-        "net.peer.port": peer_data.port,
-        "net.peer.name": host,
-        "net.transport": "IP.TCP",
-        "net.host.ip": to_string(:inet_parse.ntoa(conn.remote_ip)),
-        "net.host.port": conn.port
-      ] ++ optional_attributes(conn)
+      # Use lowercase header names as Plug.Conn normalizes headers to lowercase
+      user_agent = header_or_empty(conn, "user-agent")
+      host = header_or_empty(conn, "host")
+      peer_ip = Map.get(peer_data, :address)
+      peer_port = Map.get(peer_data, :port, 0)
 
-    # TODO: Plug should provide a monotonic native time in measurements to use here
-    # for the `start_time` option
-    span_ctx = Tracer.start_span(span_name, %{attributes: attributes, kind: :server})
+      # Build attributes list, safely handling nil IPs
+      attributes =
+        [
+          "http.target": conn.request_path,
+          "http.host": conn.host,
+          "http.scheme": conn.scheme,
+          "http.flavor": http_flavor(conn.adapter),
+          "http.route": route,
+          "http.user_agent": user_agent,
+          "http.method": conn.method,
+          "net.peer.ip": safe_ip_to_string(peer_ip),
+          "net.peer.port": peer_port,
+          "net.peer.name": host,
+          "net.transport": "IP.TCP",
+          "net.host.ip": safe_ip_to_string(conn.remote_ip),
+          "net.host.port": conn.port
+        ] ++ optional_attributes(conn)
 
-    Tracer.set_current_span(span_ctx)
+      # TODO: Plug should provide a monotonic native time in measurements to use here
+      # for the `start_time` option
+      span_ctx = Tracer.start_span(span_name, %{attributes: attributes, kind: :server})
+
+      Tracer.set_current_span(span_ctx)
+    rescue
+      e ->
+        # If anything fails, restore the parent context to prevent leaks
+        restore_parent_ctx()
+        reraise e, __STACKTRACE__
+    end
   end
 
   @doc false
@@ -184,15 +208,39 @@ defmodule OpentelemetryPlug do
     end
   end
 
-  @ctx_key {__MODULE__, :parent_ctx}
+  # Safely converts an IP address tuple to string, handling nil values
+  defp safe_ip_to_string(nil), do: ""
+
+  defp safe_ip_to_string(ip) do
+    try do
+      to_string(:inet_parse.ntoa(ip))
+    rescue
+      _ -> ""
+    end
+  end
+
+  # Use a stack-based approach to handle nested request contexts
+  # This prevents context corruption in nested plug calls
+  @ctx_key {__MODULE__, :parent_ctx_stack}
+
   defp save_parent_ctx() do
     ctx = Tracer.current_span_ctx()
-    Process.put(@ctx_key, ctx)
+    stack = Process.get(@ctx_key, [])
+    Process.put(@ctx_key, [ctx | stack])
   end
 
   defp restore_parent_ctx() do
-    ctx = Process.get(@ctx_key, :undefined)
-    Process.delete(@ctx_key)
-    Tracer.set_current_span(ctx)
+    case Process.get(@ctx_key, []) do
+      [ctx | rest] ->
+        Process.put(@ctx_key, rest)
+        # Only restore if the context is valid (not :undefined)
+        if ctx != :undefined do
+          Tracer.set_current_span(ctx)
+        end
+
+      [] ->
+        Process.delete(@ctx_key)
+        :ok
+    end
   end
 end
